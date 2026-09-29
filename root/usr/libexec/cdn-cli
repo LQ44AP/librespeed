@@ -1,0 +1,237 @@
+#!/bin/sh
+# LibreSpeed-compatible measurement: China CDN download + uutest upload.
+# v6: dynamic server discovery (uutest /register/v2, 24h cache) + HEALTH CHECK
+#     (dead CDNs are probed out, they would silently halve throughput).
+# Upload: UW persistent keep-alive connections, zero-fork URL build.
+
+case "$1" in
+  -h|--help)
+    echo "Usage: cdn-cli [--json]"
+    echo "Dynamic uutest server discovery + health-checked CDN download / uutest upload."
+    exit 0 ;;
+esac
+
+# --- portable plumbing: interface from --interface <dev>, data dir auto-detect ---
+IFACE=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --interface)
+      shift
+      [ $# -gt 0 ] && IFACE="$1"
+      ;;
+  esac
+  shift
+done
+[ -n "$IFACE" ] || IFACE=$(uci -q get network.wan.device 2>/dev/null)
+[ -n "$IFACE" ] || IFACE=$(uci -q get network.wan.ifname 2>/dev/null)
+[ -n "$IFACE" ] || IFACE=$(ubus call network.interface.wan status 2>/dev/null | jsonfilter -e '@.l3_device' 2>/dev/null)
+[ -n "$IFACE" ] || IFACE=$(ubus call network.interface.wan status 2>/dev/null | jsonfilter -e '@.device' 2>/dev/null)
+[ -n "$IFACE" ] || IFACE=$(ip -4 route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')
+[ -n "$IFACE" ] || IFACE=$(awk '/:/{print $1}' /proc/net/dev | grep -v '^lo' | head -1 | tr -d ':')
+DATA=/mnt/data/librespeed
+if [ ! -d /mnt/data ] || [ ! -w /mnt/data ]; then DATA=/etc/librespeed; fi
+mkdir -p "$DATA" 2>/dev/null
+
+RXB(){ grep "$IFACE:" /proc/net/dev | tr -s " " | cut -d" " -f3; }
+TXB(){ grep "$IFACE:" /proc/net/dev | tr -s " " | cut -d" " -f11; }
+
+# --- fallback defaults (used only when discovery fails) ---
+DL_URL="http://static.iqiyi.com/ext/common/IQIYIsetup_appstore.exe"
+UP_URL="http://39.170.43.234:19999/speed/uptext.php"
+PING_URL="http://39.170.43.234:19999/speed/uptext.php"
+
+W=24
+TSEC=12
+UW=16
+UPOSTS=300
+USEC=20
+CACHE="$DATA/uutest-servers.json"
+DLF="$DATA/uutest-dl.txt"
+
+# --- request bodies generated inline (the API ignores sign and device fields) ---
+IMEI=openwrt-$(cat /sys/class/net/$IFACE/address 2>/dev/null | tr -d ':')
+case "$IMEI" in openwrt-) IMEI=openwrt-000000000000 ;; esac
+REG_BODY="app_type=1001&device_brand=OpenWrt&device_imei=$IMEI&device_network=WIFI&device_os_type=OpenWrt&device_signal_value=0&device_type=OpenWrt Router&device_version=25.12&lang=zh-cn&last_update=20200920102446&soft_version=3.8.6&device_os_type_detail=OpenWrt Linux"
+IDX_BODY="device_imei=$IMEI"
+
+# --- dynamic server discovery (same API the phone app uses) ---
+dl_list=""
+if :; then
+  ok=0
+  if [ -s "$CACHE" ]; then
+    E=$(head -n1 "$CACHE" 2>/dev/null)
+    case "$E" in *[!0-9]*|"") E=0 ;; esac
+    [ $(( $(date +%s) - E )) -lt 86400 ] && ok=1
+  fi
+  if [ $ok -eq 0 ]; then
+    curl -s --compressed --max-time 8 -X POST 'http://uapi.uutest.cn/register/v2' \
+      -H 'Content-Type: application/x-www-form-urlencoded; charset=utf-8' \
+      -H 'User-Agent: UUSpeedTest/3.8.6 CFNetwork/3896.100.1.2.1 Darwin/27.0.0' \
+      --data "$REG_BODY" > /tmp/uutest-reg.json 2>/dev/null
+    if grep -q '"download_url":\[' /tmp/uutest-reg.json 2>/dev/null; then
+      printf '%s\n' "$(date +%s)" > "$CACHE"
+      cat /tmp/uutest-reg.json >> "$CACHE"
+      ok=1
+    fi
+  fi
+  if [ $ok -eq 1 ]; then
+    J=$(tail -n +2 "$CACHE" 2>/dev/null)
+    P=$(printf '%s\n' "$J" | grep -o '"ping_url":"[^"]*"' | head -1 | sed 's/.*:"//;s/"$//')
+    case "$P" in http*) PING_URL="$P" ;; *.[a-z]*) PING_URL="http://$P" ;; esac
+    U=$(printf '%s\n' "$J" | grep -o '"upload_url":\[{[^]]*\]\}' | grep -o 'http[^"]*' | head -1 | sed 's/\\//g')
+    [ -n "$U" ] && UP_URL="$U"
+    dl_list=$(printf '%s\n' "$J" | grep -o '"download_url":\[[^]]*\]' | grep -o '"url":"[^"]*"' | sed 's/"url":"//;s/"$//;s/\\//g' | awk '!seen[$0]++' | head -4)
+  fi
+fi
+
+# --- health check: drop dead CDNs (they would silently halve throughput) ---
+if [ -n "$dl_list" ]; then
+  GOOD=""
+  if [ -s "$DLF" ]; then
+    EF=$(head -n1 "$DLF" 2>/dev/null)
+    case "$EF" in *[!0-9]*|"") EF=0 ;; esac
+    [ $(( $(date +%s) - EF )) -lt 86400 ] && GOOD=$(tail -n +2 "$DLF")
+  fi
+  if [ -z "$GOOD" ]; then
+    printf '%s\n' "$dl_list" | while read -r u; do
+      R0=$(RXB)
+      curl -s --max-time 3 "$u?probe" > /dev/null
+      R1=$(RXB)
+      [ $((R1-R0)) -gt 300000 ] && printf '%s\n' "$u"
+    done > /tmp/uutest-good.txt
+    GOOD=$(cat /tmp/uutest-good.txt 2>/dev/null)
+    if [ -n "$GOOD" ]; then
+      printf '%s\n' "$(date +%s)" > "$DLF"
+      printf '%s\n' "$GOOD" >> "$DLF"
+    fi
+  fi
+  [ -n "$GOOD" ] && dl_list="$GOOD"
+fi
+
+# --- server label derived from the sources actually in use (no hardcoding) ---
+SRVNAME=$(printf '%s\n' "$dl_list" | sed 's#^http://##; s#/.*##' | awk '{printf "%s%s", s, $0; s=" \302\267 "}')
+[ -n "$SRVNAME" ] || SRVNAME=CDN
+SRVURL=$(printf '%s\n' "$dl_list" | sed -n '1p')
+[ -n "$SRVURL" ] || SRVURL="$DL_URL"
+
+# --- location info (region/isp/ip) from /api/index, 1h cache ---
+UCACHE="$DATA/uutest-user.json"
+REGION=""; ISP=""; WIP=""
+if :; then
+  UF=0
+  if [ -s "$UCACHE" ]; then
+    EU=$(head -n1 "$UCACHE" 2>/dev/null)
+    case "$EU" in *[!0-9]*|"") EU=0 ;; esac
+    [ $(( $(date +%s) - EU )) -lt 3600 ] && UF=1
+  fi
+  if [ $UF -eq 0 ]; then
+    curl -s --compressed --max-time 6 -X POST 'http://uapi.uutest.cn/api/index' \
+      -H 'Content-Type: application/x-www-form-urlencoded; charset=utf-8' \
+      -H 'User-Agent: UUSpeedTest/3.8.6 CFNetwork/3896.100.1.2.1 Darwin/27.0.0' \
+      --data "$IDX_BODY" > /tmp/uutest-user.json 2>/dev/null
+    grep -q '"isp"' /tmp/uutest-user.json 2>/dev/null && {
+      printf '%s\n' "$(date +%s)" > "$UCACHE"
+      cat /tmp/uutest-user.json >> "$UCACHE"
+    }
+  fi
+  if [ -s "$UCACHE" ]; then
+    UJ=$(tail -n +2 "$UCACHE")
+    REGION=$(printf '%s\n' "$UJ" | grep -o '"region":"[^"]*"' | head -1 | sed 's/.*:"//;s/"$//')
+    ISP=$(printf '%s\n' "$UJ" | grep -o '"isp":"[^"]*"' | head -1 | sed 's/.*:"//;s/"$//')
+    WIP=$(printf '%s\n' "$UJ" | grep -o '"ip":"[^"]*"' | head -1 | sed 's/.*:"//;s/"$//')
+  fi
+fi
+[ -n "$ISP" ] || ISP="China Unicom"
+
+head -c 102400 /dev/zero > /tmp/cdn_up.bin
+
+# --- latency: ICMP-probe the dynamic candidates, keep the fastest; jitter from the samples ---
+PINGT=""
+CANDS=""
+[ -n "$PING_URL" ] && CANDS="$CANDS $(printf '%s' "$PING_URL" | sed 's#^http://##; s#^https://##; s#/.*##')"
+[ -n "$UP_URL" ] && CANDS="$CANDS $(printf '%s' "$UP_URL" | sed 's#^http://##; s#/.*##; s#:.*##')"
+if [ -n "$dl_list" ]; then
+  CANDS="$CANDS $(printf '%s\n' "$dl_list" | sed 's#^http://##; s#/.*##' | head -2 | tr '\n' ' ')"
+fi
+BEST=""; BJ="0"; BS=""
+for h in $CANDS; do
+  OUT=$(ping -4 -c 3 -W 1 "$h" 2>/dev/null)
+  SAMP=$(printf '%s\n' "$OUT" | grep -o 'time=[0-9.]*' | sed 's/time=//' | tr '\n' ' ')
+  case "$SAMP" in ''|' ') continue ;; esac
+  A=$(awk -v s="$SAMP" "BEGIN{n=split(s,a,\" \");t=0;for(i=1;i<=n;i++)t+=a[i];printf \"%.3f\", t/n}")
+  J=$(awk -v s="$SAMP" "BEGIN{n=split(s,a,\" \");if(n<2){printf \"0\"}else{d=0;for(i=2;i<=n;i++){v=a[i]-a[i-1];if(v<0)v=-v;d+=v}printf \"%.3f\", d/(n-1)}}")
+  if [ -z "$BEST" ] || [ "$(awk -v a=$A -v b=$BEST "BEGIN{printf \"%d\", (a<b)}")" = 1 ]; then
+    BEST=$A; BJ=$J; PINGT=$h; BS=$SAMP
+  fi
+done
+if [ -n "$BEST" ]; then
+  PING_MS=$(awk -v a=$BEST "BEGIN{printf \"%.2f\", a}")
+  JIT=$(awk -v a=$BJ "BEGIN{printf \"%.2f\", a}")
+else
+  PINGT=$(printf '%s' "$PING_URL" | sed 's#^http://##; s#/.*##')
+  T1=$(curl -s -o /dev/null -w "%{time_connect}" --max-time 5 "$PING_URL")
+  T2=$(curl -s -o /dev/null -w "%{time_connect}" --max-time 5 "$PING_URL")
+  T3=$(curl -s -o /dev/null -w "%{time_connect}" --max-time 5 "$PING_URL")
+  PING_MS=$(awk -v a=$T1 -v b=$T2 -v c=$T3 "BEGIN{printf \"%.2f\", (a+b+c)*1000/3}")
+  JIT=$(awk -v a=$T1 -v b=$T2 -v c=$T3 "BEGIN{d1=a-b;if(d1<0)d1=-d1;d2=b-c;if(d2<0)d2=-d2;printf \"%.2f\", (d1+d2)*1000/2}")
+fi
+echo "ping: ${PING_MS} ms jitter ${JIT} ms to ${PINGT} samples: ${BS:-tcp-connect}" >&2
+
+
+# --- download (W parallel streams spread over HEALTHY discovered CDNs) ---
+R0=$(RXB)
+ND=0
+[ -n "$dl_list" ] && ND=$(printf '%s\n' "$dl_list" | grep -c .)
+i=0; L=""
+while [ $i -lt $W ]; do
+  if [ "$ND" -gt 0 ]; then
+    K=$(( i % ND + 1 ))
+    U2=$(printf '%s\n' "$dl_list" | sed -n "${K}p")
+  else
+    U2="$DL_URL"
+  fi
+  L="$L $U2?t=$i"
+  i=$((i+1))
+done
+curl -s --parallel --parallel-max $W --max-time $TSEC $L > /dev/null
+R1=$(RXB)
+DL_BYTES=$((R1-R0))
+DL=$(awk -v b=$DL_BYTES -v t=$TSEC "BEGIN{printf \"%.2f\", b*8/t/1000000}")
+
+# --- upload (UW persistent keep-alive connections, sustained 100KB POSTs) ---
+T0=$(TXB)
+S=$(date +%s)
+i=0
+while [ $i -lt $UW ]; do
+  (
+    L=""
+    j=0
+    while [ $j -lt $UPOSTS ]; do L="$L $UP_URL?w$i-$j"; j=$((j+1)); done
+    timeout $((USEC+3)) curl -s --max-time $USEC -X POST --data-binary @/tmp/cdn_up.bin -H "Content-Type: application/octet-stream" $L > /dev/null
+  ) &
+  i=$((i+1))
+done
+wait
+T1=$(TXB)
+E2=$(date +%s)
+UT=$((E2-S)); [ "$UT" -lt 1 ] && UT=1
+UL_BYTES=$((T1-T0))
+UL=$(awk -v b=$UL_BYTES -v t=$UT "BEGIN{printf \"%.2f\", b*8/t/1000000}")
+
+# --- report to uutest; the reply carries the national ranking ---
+RANK=""; PERCENT=""; SHARE=""
+DLV=$(awk -v a=$DL "BEGIN{printf \"%.6f\", a*1024}")
+ULV=$(awk -v a=$UL "BEGIN{printf \"%.6f\", a*1024}")
+RPT_BODY="app_type=1001&city_name=&device_imei=$IMEI&device_lat=0&device_lng=0&device_network=WIFI&device_signal_value=0&download_value=$DLV&hgw_ping_ip=&hgw_ping_value=$PING_MS&ident=&lang=zh-cn&ping_value=$PING_MS&red_packet=0&region_name=&server_status=1|0|0&soft_version=3.8.6&upload_value=$ULV"
+curl -s --compressed --max-time 6 -X POST 'http://uapi.uutest.cn/upload_result/v2' \
+  -H 'Content-Type: application/x-www-form-urlencoded; charset=utf-8' \
+  -H 'User-Agent: UUSpeedTest/3.8.6 CFNetwork/3896.100.1.2.1 Darwin/27.0.0' \
+  --data "$RPT_BODY" > /tmp/uutest-rank.json 2>/dev/null
+if grep -q '"percent"' /tmp/uutest-rank.json 2>/dev/null; then
+  PERCENT=$(grep -o '"percent":"[^"]*"' /tmp/uutest-rank.json | head -1 | sed 's/.*:"//;s/"$//')
+  RANK=$(grep -o '"rank":"[^"]*"' /tmp/uutest-rank.json | head -1 | sed 's/.*:"//;s/"$//')
+  SHARE=$(grep -o '"share_url":"[^"]*"' /tmp/uutest-rank.json | head -1 | sed 's/.*:"//;s/"$//;s/\\//g')
+fi
+
+TS=$(date -u "+%Y-%m-%dT%H:%M:%S.000Z")
+printf '[{"timestamp":"%s","ping":%s,"jitter":%s,"download":%s,"upload":%s,"bytes_sent":%s,"bytes_received":%s,"share":"","ping_target":"%s","ranking":{"rank":"%s","percent":"%s","share_url":"%s"},"server":{"id":1,"name":"%s","url":"%s"},"client":{"ip":"%s","org":"%s","region":"%s","isp":"%s"}}]' "$TS" "$PING_MS" "$JIT" "$DL" "$UL" "$UL_BYTES" "$DL_BYTES" "$PINGT" "$RANK" "$PERCENT" "$SHARE" "$SRVNAME" "$SRVURL" "$WIP" "$ISP" "$REGION" "$ISP"
