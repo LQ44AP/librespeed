@@ -145,11 +145,3 @@ jobs:
           path: ${{ github.workspace }}/output/*
           if-no-files-found: error
 
-      - name: Upload build log
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: build-log-${{ matrix.version }}-${{ matrix.arch.name }}
-          path: ${{ github.workspace }}/build-${{ matrix.version }}-${{ matrix.arch.name }}.log
-          if-no-files-found: ignore
-
