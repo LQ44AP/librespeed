@@ -99,7 +99,7 @@ jobs:
           rsync -a --exclude='.git' --exclude='.github' \
             --exclude='*.ipk' --exclude='*.apk' \
             --exclude='build-*.log' \
-            ${{ github.workspace }}/package-src/ package/$PKG_NAME/
+            ${{ github.workspace }}/ package/$PKG_NAME/
 
           # 确保可执行权限（Windows checkout 可能丢失）
           chmod 0755 package/$PKG_NAME/root/etc/init.d/librespeed 2>/dev/null || true
